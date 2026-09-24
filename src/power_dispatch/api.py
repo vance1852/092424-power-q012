@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,6 +25,7 @@ class Response:
 class JsonApplication:
     def __init__(self, service: SupplyService) -> None:
         self.service = service
+        self._lock = threading.Lock()
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -45,6 +47,11 @@ class JsonApplication:
         return value
 
     def handle(self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b"") -> Response:
+        # ThreadingHTTPServer 每个请求一个线程；SQLite 单写者语义下串行处理全部请求。
+        with self._lock:
+            return self._dispatch(method, target, headers, body)
+
+    def _dispatch(self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b"") -> Response:
         normalized = {key.lower(): value for key, value in (headers or {}).items()}
         parsed = urlparse(target)
         path = parsed.path.rstrip("/") or "/"
@@ -83,6 +90,36 @@ class JsonApplication:
                 return Response(200, self.service.approve_scenario(actor, parts[1], int(payload["expected_revision"])))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "run":
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
+            if method == "POST" and path == "/maintenance/units":
+                return Response(201, self.service.register_unit(actor, payload))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["maintenance", "units"] and parts[3] == "commitment":
+                return Response(200, self.service.update_unit_commitment(actor, parts[2], payload["committed_mw"], int(payload["expected_revision"])))
+            if method == "POST" and path == "/maintenance/requirements":
+                return Response(201, self.service.register_reserve_requirement(actor, payload))
+            if method == "POST" and path == "/maintenance/requests":
+                return Response(201, self.service.submit_maintenance(actor, payload))
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["maintenance", "requests"]:
+                return Response(200, self.service.maintenance_request(parts[2]))
+            if len(parts) == 4 and parts[:2] == ["maintenance", "requests"]:
+                action = parts[3]
+                if method == "GET" and action == "history":
+                    return Response(200, self.service.maintenance_history(parts[2]))
+                if method == "POST" and action == "assess":
+                    return Response(200, self.service.assess_maintenance(actor, parts[2]))
+                if method == "POST" and action == "approve":
+                    return Response(200, self.service.approve_maintenance(actor, parts[2], int(payload["expected_version"])))
+                if method == "POST" and action == "activate":
+                    return Response(200, self.service.activate_maintenance(actor, parts[2]))
+                if method == "POST" and action == "extend":
+                    return Response(200, self.service.extend_maintenance(actor, parts[2], payload.get("new_ends_at"), payload.get("note")))
+                if method == "POST" and action == "cancel":
+                    return Response(200, self.service.cancel_maintenance(actor, parts[2], payload.get("note")))
+                if method == "POST" and action == "restore":
+                    return Response(200, self.service.restore_maintenance(actor, parts[2]))
+                if method == "POST" and action == "replay":
+                    return Response(200, self.service.replay_maintenance(actor, parts[2], int(payload["version_no"])))
+            if method == "GET" and path == "/maintenance/capability":
+                return Response(200, self.service.regional_capability(query.get("region", [""])[0], query.get("starts_at", [""])[0], query.get("ends_at", [""])[0]))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})

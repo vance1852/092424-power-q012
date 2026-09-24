@@ -15,7 +15,8 @@ from .service import SupplyService
 def run(workspace: Path) -> dict[str, object]:
     connection = sqlite3.connect(":memory:", isolation_level=None)
     connection.row_factory = sqlite3.Row
-    service = SupplyService(connection, FrozenClock(datetime(2026, 9, 24, 8, 0, tzinfo=timezone.utc)))
+    clock = FrozenClock(datetime(2026, 9, 24, 8, 0, tzinfo=timezone.utc))
+    service = SupplyService(connection, clock)
     for user_id, role in (("plan", "planner"), ("dispatch", "dispatcher"), ("risk", "risk"), ("audit", "auditor")):
         service.create_user(user_id, user_id, role)
     for index, close in enumerate(("108", "105", "102", "100", "98", "96"), start=18):
@@ -30,7 +31,33 @@ def run(workspace: Path) -> dict[str, object]:
     service.create_scenario("plan", {"scenario_id": "pipeline-restart", "name": "关键机组检修恢复与需求回落", "market_index_drop_percent": "9", "route_capacity_changes": {"pipe-a-b": "20"}, "demand_changes": {"field-a:crude": "-5"}})
     service.approve_scenario("risk", "pipeline-restart", 1)
     scenario = service.run_scenario("plan", "pipeline-restart", "2026-09-23")
-    result = {"status": "ok", "price": service.price_summary("PEAK_VALLEY"), "allocation_id": allocation["allocation_id"], "transfer": transfer, "scenario_run_id": scenario["run_id"], "audit": service.audit_chain("audit"), "workspace": workspace.name}
+    service.register_unit("plan", {"unit_id": "unit-1", "facility_id": "field-a", "region": "north", "capacity_mw": "300", "committed_mw": "50"})
+    service.register_unit("plan", {"unit_id": "unit-2", "facility_id": "field-a", "region": "north", "capacity_mw": "300", "committed_mw": "50"})
+    service.register_reserve_requirement("risk", {"requirement_id": "peak-1001", "region": "north", "label": "peak", "starts_at": "2026-10-01T08:00:00Z", "ends_at": "2026-10-01T12:00:00Z", "min_reserve_mw": "200"})
+    service.register_reserve_requirement("risk", {"requirement_id": "peak-1002", "region": "north", "label": "peak", "starts_at": "2026-10-02T08:00:00Z", "ends_at": "2026-10-02T12:00:00Z", "min_reserve_mw": "200"})
+    service.submit_maintenance("plan", {"request_id": "mnt-001", "unit_id": "unit-1", "starts_at": "2026-10-01T08:00:00Z", "ends_at": "2026-10-01T12:00:00Z", "reason": "机组定检"})
+    service.submit_maintenance("plan", {"request_id": "mnt-002", "unit_id": "unit-2", "starts_at": "2026-10-02T08:00:00Z", "ends_at": "2026-10-02T12:00:00Z", "reason": "错峰定检"})
+    first_assessment = service.assess_maintenance("risk", "mnt-001")
+    service.approve_maintenance("risk", "mnt-001", 1)
+    second_assessment = service.assess_maintenance("risk", "mnt-002")
+    service.approve_maintenance("risk", "mnt-002", 1)
+    clock.advance(days=7, hours=1)
+    service.activate_maintenance("dispatch", "mnt-001")
+    service.restore_maintenance("dispatch", "mnt-001")
+    service.extend_maintenance("plan", "mnt-002", "2026-10-02T14:00:00Z", "发现缺陷需要延长两小时")
+    extended_assessment = service.assess_maintenance("risk", "mnt-002")
+    service.approve_maintenance("risk", "mnt-002", 2)
+    replay = service.replay_maintenance("audit", "mnt-002", 2)
+    capability = service.regional_capability("north", "2026-10-02T00:00:00Z", "2026-10-03T00:00:00Z")
+    maintenance = {
+        "first_verdict": first_assessment["verdict"],
+        "second_verdict": second_assessment["verdict"],
+        "extended_verdict": extended_assessment["verdict"],
+        "mnt_002_state": service.maintenance_request("mnt-002")["state"],
+        "replay_all_matched": replay["all_matched"],
+        "capability_slices": len(capability["slices"]),
+    }
+    result = {"status": "ok", "price": service.price_summary("PEAK_VALLEY"), "allocation_id": allocation["allocation_id"], "transfer": transfer, "scenario_run_id": scenario["run_id"], "maintenance": maintenance, "audit": service.audit_chain("audit"), "workspace": workspace.name}
     connection.close()
     return result
 

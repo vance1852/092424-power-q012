@@ -194,11 +194,84 @@ CREATE TABLE IF NOT EXISTS supply_audit_events (
 
 CREATE INDEX IF NOT EXISTS idx_supply_audit_entity
 ON supply_audit_events(entity_type, entity_id, event_id);
+
+CREATE TABLE IF NOT EXISTS maintenance_units (
+    unit_id TEXT PRIMARY KEY,
+    facility_id TEXT NOT NULL REFERENCES facilities(facility_id),
+    region TEXT NOT NULL,
+    capacity_mw TEXT NOT NULL,
+    committed_mw TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    state TEXT NOT NULL DEFAULT 'available' CHECK(state IN ('available','retired')),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_units_region
+ON maintenance_units(region);
+
+CREATE TABLE IF NOT EXISTS reserve_requirements (
+    requirement_id TEXT PRIMARY KEY,
+    region TEXT NOT NULL,
+    label TEXT NOT NULL,
+    starts_at TEXT NOT NULL,
+    ends_at TEXT NOT NULL,
+    min_reserve_mw TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_requirements_region_time
+ON reserve_requirements(region, starts_at, ends_at);
+
+CREATE TABLE IF NOT EXISTS maintenance_requests (
+    request_id TEXT PRIMARY KEY,
+    unit_id TEXT NOT NULL REFERENCES maintenance_units(unit_id),
+    reason TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'submitted'
+        CHECK(state IN ('submitted','assessed','approved','effective','restored','cancelled')),
+    current_version INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    closed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_maintenance_unit_state
+ON maintenance_requests(unit_id, state);
+
+CREATE TABLE IF NOT EXISTS maintenance_versions (
+    version_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL REFERENCES maintenance_requests(request_id),
+    version_no INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('initial','extension','cancellation')),
+    starts_at TEXT NOT NULL,
+    ends_at TEXT NOT NULL,
+    note TEXT NOT NULL,
+    prior_state TEXT,
+    capability_sha256 TEXT,
+    approved_by TEXT REFERENCES supply_users(user_id),
+    approved_at TEXT,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    UNIQUE(request_id, version_no)
+);
+
+CREATE TABLE IF NOT EXISTS maintenance_assessments (
+    assessment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL REFERENCES maintenance_requests(request_id),
+    version_no INTEGER NOT NULL,
+    input_sha256 TEXT NOT NULL,
+    input_json TEXT NOT NULL,
+    verdict TEXT NOT NULL CHECK(verdict IN ('pass','conflict')),
+    result_json TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    UNIQUE(request_id, version_no, input_sha256)
+);
 """
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")

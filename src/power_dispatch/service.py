@@ -11,7 +11,26 @@ from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
+from .maintenance import (
+    ApprovedWindow,
+    RequirementWindow,
+    UnitCapability,
+    assessment_from_input,
+    reserve_slices,
+)
+from .models import (
+    IndexQuote,
+    Facility,
+    InventoryLot,
+    MaintenanceRequestInput,
+    MaintenanceUnit,
+    NominationRequest,
+    ReserveRequirement,
+    Route,
+    SupplyScenario,
+    decimal_value,
+    required_text,
+)
 from .planning import (
     AllocationRequest,
     PricePoint,
@@ -31,10 +50,13 @@ from .storage import initialize, transaction
 
 
 ROLE_PERMISSIONS = {
-    "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
-    "risk": {"outage.write", "scenario.approve", "report.read"},
-    "auditor": {"report.read", "audit.read"},
+    "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run",
+                "unit.write", "maintenance.write"},
+    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write",
+                   "commitment.write", "maintenance.operate"},
+    "risk": {"outage.write", "scenario.approve", "report.read",
+             "requirement.write", "maintenance.assess", "maintenance.approve", "maintenance.replay"},
+    "auditor": {"report.read", "audit.read", "maintenance.replay"},
 }
 
 
@@ -547,6 +569,608 @@ class SupplyService:
             run_id = int(cursor.lastrowid)
             self._audit("scenario", scenario_id, "scenario.executed", actor_id, {"run_id": run_id})
         return {"run_id": run_id, **result, "replayed": False}
+
+    def register_unit(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "unit.write")
+        unit = MaintenanceUnit.from_dict(raw)
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO maintenance_units(unit_id,facility_id,region,capacity_mw,committed_mw,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (
+                        unit.unit_id,
+                        unit.facility_id,
+                        unit.region,
+                        decimal_text(unit.capacity_mw),
+                        decimal_text(unit.committed_mw),
+                        self._now(),
+                    ),
+                )
+                self._audit("maintenance_unit", unit.unit_id, "unit.registered", actor_id, dict(raw))
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("机组编号冲突或设施不存在") from exc
+        return self.unit(unit.unit_id)
+
+    def _unit_row(self, unit_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM maintenance_units WHERE unit_id=?", (unit_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("机组不存在")
+        return row
+
+    def unit(self, unit_id: str) -> dict[str, Any]:
+        return dict(self._unit_row(unit_id))
+
+    def update_unit_commitment(
+        self,
+        actor_id: str,
+        unit_id: str,
+        committed_mw: object,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        self._require(actor_id, "commitment.write")
+        unit = self._unit_row(unit_id)
+        committed = decimal_value(committed_mw, "committed_mw", minimum=Decimal("0"))
+        if committed > Decimal(unit["capacity_mw"]):
+            raise ValidationFailed("committed_mw 不能超过 capacity_mw")
+        locked = self.connection.execute(
+            "SELECT r.request_id FROM maintenance_requests r "
+            "JOIN maintenance_versions v ON v.request_id=r.request_id "
+            "WHERE r.unit_id=? AND r.state IN ('submitted','assessed','approved','effective') "
+            "AND v.capability_sha256 IS NOT NULL LIMIT 1",
+            (unit_id,),
+        ).fetchone()
+        if locked is not None:
+            raise Conflict("机组存在已锁定能力版本的检修计划，承诺出力不可修改")
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE maintenance_units SET committed_mw=?,revision=revision+1 WHERE unit_id=? AND revision=?",
+                (decimal_text(committed), unit_id, expected_revision),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("机组版本已变化")
+            self._audit(
+                "maintenance_unit",
+                unit_id,
+                "unit.commitment_updated",
+                actor_id,
+                {"previous_committed_mw": unit["committed_mw"], "committed_mw": decimal_text(committed)},
+            )
+        return self.unit(unit_id)
+
+    def register_reserve_requirement(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "requirement.write")
+        requirement = ReserveRequirement.from_dict(raw)
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO reserve_requirements(requirement_id,region,label,starts_at,ends_at,"
+                    "min_reserve_mw,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        requirement.requirement_id,
+                        requirement.region,
+                        requirement.label,
+                        requirement.starts_at,
+                        requirement.ends_at,
+                        decimal_text(requirement.min_reserve_mw),
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                self._audit("reserve_requirement", requirement.requirement_id, "requirement.registered", actor_id, dict(raw))
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("峰谷时段编号已经存在") from exc
+        return {
+            "requirement_id": requirement.requirement_id,
+            "region": requirement.region,
+            "label": requirement.label,
+            "starts_at": requirement.starts_at,
+            "ends_at": requirement.ends_at,
+            "min_reserve_mw": decimal_text(requirement.min_reserve_mw),
+        }
+
+    def submit_maintenance(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "maintenance.write")
+        request = MaintenanceRequestInput.from_dict(raw)
+        unit = self._unit_row(request.unit_id)
+        if unit["state"] != "available":
+            raise InvalidState("机组已退役")
+        try:
+            with transaction(self.connection, immediate=True):
+                open_request = self.connection.execute(
+                    "SELECT request_id FROM maintenance_requests WHERE unit_id=? "
+                    "AND state IN ('submitted','assessed','approved','effective')",
+                    (request.unit_id,),
+                ).fetchone()
+                if open_request is not None:
+                    raise Conflict("机组已存在未关闭的检修申请")
+                self.connection.execute(
+                    "INSERT INTO maintenance_requests(request_id,unit_id,reason,created_by,created_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (request.request_id, request.unit_id, request.reason, actor_id, self._now()),
+                )
+                self.connection.execute(
+                    "INSERT INTO maintenance_versions(request_id,version_no,kind,starts_at,ends_at,note,"
+                    "created_by,created_at) VALUES(?,1,'initial',?,?,?,?,?)",
+                    (request.request_id, request.starts_at, request.ends_at, request.reason, actor_id, self._now()),
+                )
+                self._audit(
+                    "maintenance",
+                    request.request_id,
+                    "maintenance.submitted",
+                    actor_id,
+                    {"unit_id": request.unit_id, "version_no": 1,
+                     "starts_at": request.starts_at, "ends_at": request.ends_at},
+                )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("检修申请编号已经存在") from exc
+        return {"request_id": request.request_id, "state": "submitted", "current_version": 1}
+
+    def _request_row(self, request_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM maintenance_requests WHERE request_id=?", (request_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("检修申请不存在")
+        return row
+
+    def _version_row(self, request_id: str, version_no: int) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM maintenance_versions WHERE request_id=? AND version_no=?",
+            (request_id, version_no),
+        ).fetchone()
+        if row is None:
+            raise NotFound("检修版本不存在")
+        return row
+
+    def _operative_locked_versions(self) -> list[sqlite3.Row]:
+        """仍处于开放状态且已锁定能力版本的检修窗口（延长审批期间旧版本继续生效）。"""
+        return self.connection.execute(
+            "SELECT r.request_id,r.unit_id,u.region,v.starts_at,v.ends_at "
+            "FROM maintenance_requests r "
+            "JOIN maintenance_versions v ON v.request_id=r.request_id "
+            "JOIN maintenance_units u ON u.unit_id=r.unit_id "
+            "WHERE r.state IN ('submitted','assessed','approved','effective') "
+            "AND v.capability_sha256 IS NOT NULL "
+            "AND v.version_no=(SELECT MAX(v2.version_no) FROM maintenance_versions v2 "
+            "                  WHERE v2.request_id=r.request_id AND v2.capability_sha256 IS NOT NULL) "
+            "ORDER BY r.request_id"
+        ).fetchall()
+
+    def _assessment_input(self, request: sqlite3.Row, version: sqlite3.Row) -> dict[str, Any]:
+        unit = self._unit_row(request["unit_id"])
+        units = self.connection.execute(
+            "SELECT unit_id,region,capacity_mw,committed_mw FROM maintenance_units "
+            "WHERE region=? AND state='available' ORDER BY unit_id",
+            (unit["region"],),
+        ).fetchall()
+        requirements = self.connection.execute(
+            "SELECT requirement_id,region,label,starts_at,ends_at,min_reserve_mw FROM reserve_requirements "
+            "WHERE region=? AND starts_at<? AND ends_at>? ORDER BY starts_at,requirement_id",
+            (unit["region"], version["ends_at"], version["starts_at"]),
+        ).fetchall()
+        approved = [
+            window
+            for window in self._operative_locked_versions()
+            if window["request_id"] != request["request_id"]
+            and window["region"] == unit["region"]
+            and window["starts_at"] < version["ends_at"]
+            and window["ends_at"] > version["starts_at"]
+        ]
+        return {
+            "request": {
+                "request_id": request["request_id"],
+                "version_no": version["version_no"],
+                "unit_id": unit["unit_id"],
+                "starts_at": version["starts_at"],
+                "ends_at": version["ends_at"],
+            },
+            "candidate": {
+                "unit_id": unit["unit_id"],
+                "region": unit["region"],
+                "capacity_mw": unit["capacity_mw"],
+                "committed_mw": unit["committed_mw"],
+            },
+            "units": [dict(row) for row in units],
+            "requirements": [dict(row) for row in requirements],
+            "approved": [
+                {"request_id": w["request_id"], "unit_id": w["unit_id"],
+                 "starts_at": w["starts_at"], "ends_at": w["ends_at"]}
+                for w in approved
+            ],
+        }
+
+    def assess_maintenance(self, actor_id: str, request_id: str) -> dict[str, Any]:
+        self._require(actor_id, "maintenance.assess")
+        request = self._request_row(request_id)
+        if request["state"] not in ("submitted", "assessed"):
+            raise InvalidState("当前状态不可评估")
+        version = self._version_row(request_id, request["current_version"])
+        payload = self._assessment_input(request, version)
+        input_sha256 = digest(payload)
+        existing = self.connection.execute(
+            "SELECT assessment_id,result_json FROM maintenance_assessments "
+            "WHERE request_id=? AND version_no=? AND input_sha256=?",
+            (request_id, version["version_no"], input_sha256),
+        ).fetchone()
+        if existing is not None:
+            return {
+                "assessment_id": existing["assessment_id"],
+                "input_sha256": input_sha256,
+                **json.loads(existing["result_json"]),
+                "replayed": True,
+            }
+        result = assessment_from_input(payload)
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "INSERT INTO maintenance_assessments(request_id,version_no,input_sha256,input_json,verdict,"
+                "result_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    request_id,
+                    version["version_no"],
+                    input_sha256,
+                    canonical_json(payload),
+                    result["verdict"],
+                    canonical_json(result),
+                    actor_id,
+                    self._now(),
+                ),
+            )
+            assessment_id = int(cursor.lastrowid)
+            self.connection.execute(
+                "UPDATE maintenance_requests SET state='assessed' WHERE request_id=? AND state='submitted'",
+                (request_id,),
+            )
+            self._audit(
+                "maintenance",
+                request_id,
+                "maintenance.assessed",
+                actor_id,
+                {"version_no": version["version_no"], "assessment_id": assessment_id,
+                 "verdict": result["verdict"], "input_sha256": input_sha256},
+            )
+        return {"assessment_id": assessment_id, "input_sha256": input_sha256, **result, "replayed": False}
+
+    def approve_maintenance(self, actor_id: str, request_id: str, expected_version: int) -> dict[str, Any]:
+        self._require(actor_id, "maintenance.approve")
+        request = self._request_row(request_id)
+        if request["state"] != "assessed":
+            raise InvalidState("检修申请不在待批准状态")
+        if int(request["current_version"]) != int(expected_version):
+            raise InvalidState("检修版本已变化")
+        version = self._version_row(request_id, request["current_version"])
+        assessment = self.connection.execute(
+            "SELECT * FROM maintenance_assessments WHERE request_id=? AND version_no=? "
+            "ORDER BY assessment_id DESC LIMIT 1",
+            (request_id, version["version_no"]),
+        ).fetchone()
+        if assessment is None:
+            raise InvalidState("缺少风险评估")
+        if assessment["verdict"] != "pass":
+            raise InvalidState("风险评估存在未解决冲突")
+        current_sha256 = digest(self._assessment_input(request, version))
+        if current_sha256 != assessment["input_sha256"]:
+            raise Conflict("能力版本已变化，需要重新评估")
+        new_state = "effective" if version["prior_state"] == "effective" else "approved"
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE maintenance_versions SET capability_sha256=?,approved_by=?,approved_at=? "
+                "WHERE request_id=? AND version_no=? AND capability_sha256 IS NULL",
+                (current_sha256, actor_id, self._now(), request_id, version["version_no"]),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("检修版本已锁定")
+            self.connection.execute(
+                "UPDATE maintenance_requests SET state=? WHERE request_id=?",
+                (new_state, request_id),
+            )
+            self._audit(
+                "maintenance",
+                request_id,
+                "maintenance.approved",
+                actor_id,
+                {"version_no": version["version_no"], "capability_sha256": current_sha256,
+                 "assessment_id": assessment["assessment_id"]},
+            )
+        return {
+            "request_id": request_id,
+            "state": new_state,
+            "current_version": version["version_no"],
+            "capability_sha256": current_sha256,
+        }
+
+    def activate_maintenance(self, actor_id: str, request_id: str) -> dict[str, Any]:
+        self._require(actor_id, "maintenance.operate")
+        request = self._request_row(request_id)
+        if request["state"] != "approved":
+            raise InvalidState("检修申请未批准")
+        version = self._version_row(request_id, request["current_version"])
+        now = self._now()
+        if now < version["starts_at"]:
+            raise InvalidState("检修窗口尚未开始")
+        if now >= version["ends_at"]:
+            raise InvalidState("检修窗口已结束")
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE maintenance_requests SET state='effective' WHERE request_id=? AND state='approved'",
+                (request_id,),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("检修申请状态已变化")
+            self._audit("maintenance", request_id, "maintenance.activated", actor_id,
+                        {"version_no": version["version_no"]})
+        return {"request_id": request_id, "state": "effective", "current_version": version["version_no"]}
+
+    def extend_maintenance(
+        self,
+        actor_id: str,
+        request_id: str,
+        new_ends_at: object,
+        note: object,
+    ) -> dict[str, Any]:
+        self._require(actor_id, "maintenance.write")
+        request = self._request_row(request_id)
+        if request["state"] not in ("submitted", "assessed", "approved", "effective"):
+            raise InvalidState("检修已关闭，不能延长")
+        current = self._version_row(request_id, request["current_version"])
+        try:
+            new_end = parse_utc(required_text(new_ends_at, "new_ends_at", 40), "new_ends_at")
+        except ValueError as exc:
+            raise ValidationFailed(str(exc)) from exc
+        new_end_text = utc_text(new_end)
+        if new_end_text <= current["ends_at"]:
+            raise ValidationFailed("新的结束时间必须晚于当前版本")
+        note_text = required_text(note, "note")
+        new_version_no = int(request["current_version"]) + 1
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "INSERT INTO maintenance_versions(request_id,version_no,kind,starts_at,ends_at,note,"
+                "prior_state,created_by,created_at) VALUES(?,?,'extension',?,?,?,?,?,?)",
+                (request_id, new_version_no, current["starts_at"], new_end_text, note_text,
+                 request["state"], actor_id, self._now()),
+            )
+            cursor = self.connection.execute(
+                "UPDATE maintenance_requests SET state='submitted',current_version=? "
+                "WHERE request_id=? AND current_version=?",
+                (new_version_no, request_id, request["current_version"]),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("检修版本已变化")
+            self._audit(
+                "maintenance",
+                request_id,
+                "maintenance.extended",
+                actor_id,
+                {"version_no": new_version_no, "previous_version": request["current_version"],
+                 "new_ends_at": new_end_text},
+            )
+        return {"request_id": request_id, "state": "submitted", "current_version": new_version_no}
+
+    def cancel_maintenance(self, actor_id: str, request_id: str, note: object) -> dict[str, Any]:
+        self._require(actor_id, "maintenance.write")
+        request = self._request_row(request_id)
+        if request["state"] in ("restored", "cancelled"):
+            raise InvalidState("检修已关闭")
+        current = self._version_row(request_id, request["current_version"])
+        note_text = required_text(note, "note")
+        now = self._now()
+        was_effective = request["state"] == "effective" or current["prior_state"] == "effective"
+        if was_effective:
+            locked = self.connection.execute(
+                "SELECT starts_at FROM maintenance_versions WHERE request_id=? AND capability_sha256 IS NOT NULL "
+                "ORDER BY version_no DESC LIMIT 1",
+                (request_id,),
+            ).fetchone()
+            starts_at = locked["starts_at"] if locked is not None else current["starts_at"]
+            ends_at = now if now > starts_at else starts_at
+            new_state = "restored"
+        else:
+            starts_at = current["starts_at"]
+            ends_at = current["ends_at"]
+            new_state = "cancelled"
+        new_version_no = int(request["current_version"]) + 1
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "INSERT INTO maintenance_versions(request_id,version_no,kind,starts_at,ends_at,note,"
+                "prior_state,created_by,created_at) VALUES(?,?,'cancellation',?,?,?,?,?,?)",
+                (request_id, new_version_no, starts_at, ends_at, note_text,
+                 request["state"], actor_id, self._now()),
+            )
+            self.connection.execute(
+                "UPDATE maintenance_requests SET state=?,current_version=?,closed_at=? WHERE request_id=?",
+                (new_state, new_version_no, now, request_id),
+            )
+            self._audit(
+                "maintenance",
+                request_id,
+                "maintenance.cancelled",
+                actor_id,
+                {"version_no": new_version_no, "resulting_state": new_state},
+            )
+        return {"request_id": request_id, "state": new_state, "current_version": new_version_no}
+
+    def restore_maintenance(self, actor_id: str, request_id: str) -> dict[str, Any]:
+        self._require(actor_id, "maintenance.operate")
+        request = self._request_row(request_id)
+        if request["state"] != "effective":
+            raise InvalidState("检修未生效")
+        now = self._now()
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE maintenance_requests SET state='restored',closed_at=? "
+                "WHERE request_id=? AND state='effective'",
+                (now, request_id),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("检修申请状态已变化")
+            self._audit("maintenance", request_id, "maintenance.restored", actor_id,
+                        {"version_no": request["current_version"]})
+        return {"request_id": request_id, "state": "restored", "current_version": request["current_version"]}
+
+    def replay_maintenance(self, actor_id: str, request_id: str, version_no: int) -> dict[str, Any]:
+        self._require(actor_id, "maintenance.replay")
+        self._request_row(request_id)
+        self._version_row(request_id, int(version_no))
+        rows = self.connection.execute(
+            "SELECT * FROM maintenance_assessments WHERE request_id=? AND version_no=? ORDER BY assessment_id",
+            (request_id, int(version_no)),
+        ).fetchall()
+        if not rows:
+            raise NotFound("该版本没有风险评估")
+        replays = []
+        for row in rows:
+            recomputed = assessment_from_input(json.loads(row["input_json"]))
+            replays.append({
+                "assessment_id": row["assessment_id"],
+                "input_sha256": row["input_sha256"],
+                "verdict": row["verdict"],
+                "matches": canonical_json(recomputed) == row["result_json"],
+            })
+        return {
+            "request_id": request_id,
+            "version_no": int(version_no),
+            "replays": replays,
+            "all_matched": all(item["matches"] for item in replays),
+        }
+
+    def maintenance_request(self, request_id: str) -> dict[str, Any]:
+        request = self._request_row(request_id)
+        version = self._version_row(request_id, request["current_version"])
+        assessment = self.connection.execute(
+            "SELECT verdict FROM maintenance_assessments WHERE request_id=? AND version_no=? "
+            "ORDER BY assessment_id DESC LIMIT 1",
+            (request_id, version["version_no"]),
+        ).fetchone()
+        return {
+            "request_id": request["request_id"],
+            "unit_id": request["unit_id"],
+            "reason": request["reason"],
+            "state": request["state"],
+            "current_version": request["current_version"],
+            "starts_at": version["starts_at"],
+            "ends_at": version["ends_at"],
+            "capability_sha256": version["capability_sha256"],
+            "latest_verdict": None if assessment is None else assessment["verdict"],
+            "created_by": request["created_by"],
+            "created_at": request["created_at"],
+            "closed_at": request["closed_at"],
+        }
+
+    def maintenance_history(self, request_id: str) -> dict[str, Any]:
+        request = self._request_row(request_id)
+        versions = self.connection.execute(
+            "SELECT * FROM maintenance_versions WHERE request_id=? ORDER BY version_no",
+            (request_id,),
+        ).fetchall()
+        assessments = self.connection.execute(
+            "SELECT assessment_id,version_no,verdict,input_sha256,created_by,created_at "
+            "FROM maintenance_assessments WHERE request_id=? ORDER BY assessment_id",
+            (request_id,),
+        ).fetchall()
+        by_version: dict[int, list[dict[str, Any]]] = {}
+        for row in assessments:
+            by_version.setdefault(row["version_no"], []).append({
+                "assessment_id": row["assessment_id"],
+                "verdict": row["verdict"],
+                "input_sha256": row["input_sha256"],
+                "created_by": row["created_by"],
+                "created_at": row["created_at"],
+            })
+        events = self.connection.execute(
+            "SELECT event_id,event_type,actor_id,payload_json,event_hash,created_at FROM supply_audit_events "
+            "WHERE entity_type='maintenance' AND entity_id=? ORDER BY event_id",
+            (request_id,),
+        ).fetchall()
+        return {
+            "request": self.maintenance_request(request_id),
+            "versions": [
+                {
+                    "version_no": row["version_no"],
+                    "kind": row["kind"],
+                    "starts_at": row["starts_at"],
+                    "ends_at": row["ends_at"],
+                    "note": row["note"],
+                    "prior_state": row["prior_state"],
+                    "capability_sha256": row["capability_sha256"],
+                    "approved_by": row["approved_by"],
+                    "approved_at": row["approved_at"],
+                    "created_by": row["created_by"],
+                    "created_at": row["created_at"],
+                    "assessments": by_version.get(row["version_no"], []),
+                }
+                for row in versions
+            ],
+            "audit_trail": [
+                {
+                    "event_id": row["event_id"],
+                    "event_type": row["event_type"],
+                    "actor_id": row["actor_id"],
+                    "payload": json.loads(row["payload_json"]),
+                    "event_hash": row["event_hash"],
+                    "created_at": row["created_at"],
+                }
+                for row in events
+            ],
+        }
+
+    def regional_capability(self, region: object, starts_at: object, ends_at: object) -> dict[str, Any]:
+        region_text = required_text(region, "region", 64)
+        try:
+            start = parse_utc(required_text(starts_at, "starts_at", 40), "starts_at")
+            end = parse_utc(required_text(ends_at, "ends_at", 40), "ends_at")
+        except ValueError as exc:
+            raise ValidationFailed(str(exc)) from exc
+        if end <= start:
+            raise ValidationFailed("ends_at 必须晚于 starts_at")
+        start_text = utc_text(start)
+        end_text = utc_text(end)
+        units = self.connection.execute(
+            "SELECT unit_id,region,capacity_mw,committed_mw FROM maintenance_units "
+            "WHERE region=? AND state='available' ORDER BY unit_id",
+            (region_text,),
+        ).fetchall()
+        requirements = self.connection.execute(
+            "SELECT requirement_id,region,label,starts_at,ends_at,min_reserve_mw FROM reserve_requirements "
+            "WHERE region=? AND starts_at<? AND ends_at>? ORDER BY starts_at,requirement_id",
+            (region_text, end_text, start_text),
+        ).fetchall()
+        approved = [
+            window
+            for window in self._operative_locked_versions()
+            if window["region"] == region_text
+            and window["starts_at"] < end_text
+            and window["ends_at"] > start_text
+        ]
+        slices = reserve_slices(
+            units=[
+                UnitCapability(u["unit_id"], u["region"], Decimal(u["capacity_mw"]), Decimal(u["committed_mw"]))
+                for u in units
+            ],
+            requirements=[
+                RequirementWindow(r["requirement_id"], r["region"], r["label"], r["starts_at"], r["ends_at"],
+                                  Decimal(r["min_reserve_mw"]))
+                for r in requirements
+            ],
+            approved=[
+                ApprovedWindow(w["request_id"], w["unit_id"], w["starts_at"], w["ends_at"])
+                for w in approved
+            ],
+            window_start=start_text,
+            window_end=end_text,
+        )
+        return {
+            "region": region_text,
+            "starts_at": start_text,
+            "ends_at": end_text,
+            "slices": slices,
+            "approved_maintenance": [
+                {"request_id": w["request_id"], "unit_id": w["unit_id"],
+                 "starts_at": w["starts_at"], "ends_at": w["ends_at"]}
+                for w in approved
+            ],
+        }
 
     def audit_chain(self, actor_id: str) -> dict[str, Any]:
         self._require(actor_id, "audit.read")

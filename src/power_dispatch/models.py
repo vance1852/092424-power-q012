@@ -8,7 +8,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
-from .clock import parse_utc
+from .clock import parse_utc, utc_text
 from .errors import ValidationFailed
 
 
@@ -16,6 +16,7 @@ IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{1,63}$")
 CRUDE_GRADES = {"PEAK_VALLEY", "WTI", "DUBAI", "ESPO", "URAL", "CUSTOM"}
 PRODUCTS = {"crude", "gasoline-92", "gasoline-95", "diesel", "jet-fuel", "condensate"}
 ROUTE_KINDS = {"pipeline", "terminal", "refinery", "storage", "truck-rack"}
+PEAK_LABELS = {"peak", "flat", "valley"}
 
 
 def required_text(value: object, field: str, maximum: int = 256) -> str:
@@ -259,4 +260,87 @@ class SupplyScenario:
             ),
             route_capacity_changes=parsed_routes,
             demand_changes=parsed_demand,
+        )
+
+
+def _utc_window(raw: Mapping[str, Any]) -> tuple[str, str]:
+    starts_raw = required_text(raw.get("starts_at"), "starts_at", 40)
+    ends_raw = required_text(raw.get("ends_at"), "ends_at", 40)
+    try:
+        start = parse_utc(starts_raw, "starts_at")
+        end = parse_utc(ends_raw, "ends_at")
+    except ValueError as exc:
+        raise ValidationFailed(str(exc)) from exc
+    if end <= start:
+        raise ValidationFailed("ends_at 必须晚于 starts_at")
+    return utc_text(start), utc_text(end)
+
+
+@dataclass(frozen=True, slots=True)
+class MaintenanceUnit:
+    unit_id: str
+    facility_id: str
+    region: str
+    capacity_mw: Decimal
+    committed_mw: Decimal
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "MaintenanceUnit":
+        capacity = decimal_value(raw.get("capacity_mw"), "capacity_mw", minimum=Decimal("0.001"))
+        committed = decimal_value(raw.get("committed_mw", 0), "committed_mw", minimum=Decimal("0"))
+        if committed > capacity:
+            raise ValidationFailed("committed_mw 不能超过 capacity_mw")
+        return cls(
+            unit_id=identifier(raw.get("unit_id"), "unit_id"),
+            facility_id=identifier(raw.get("facility_id"), "facility_id"),
+            region=required_text(raw.get("region"), "region", 64),
+            capacity_mw=capacity,
+            committed_mw=committed,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ReserveRequirement:
+    requirement_id: str
+    region: str
+    label: str
+    starts_at: str
+    ends_at: str
+    min_reserve_mw: Decimal
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "ReserveRequirement":
+        label = required_text(raw.get("label"), "label", 16)
+        if label not in PEAK_LABELS:
+            raise ValidationFailed("label 必须是 peak、flat 或 valley")
+        starts_at, ends_at = _utc_window(raw)
+        return cls(
+            requirement_id=identifier(raw.get("requirement_id"), "requirement_id"),
+            region=required_text(raw.get("region"), "region", 64),
+            label=label,
+            starts_at=starts_at,
+            ends_at=ends_at,
+            min_reserve_mw=decimal_value(
+                raw.get("min_reserve_mw"), "min_reserve_mw", minimum=Decimal("0")
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MaintenanceRequestInput:
+    request_id: str
+    unit_id: str
+    starts_at: str
+    ends_at: str
+    reason: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "MaintenanceRequestInput":
+        starts_at, ends_at = _utc_window(raw)
+        return cls(
+            request_id=identifier(raw.get("request_id"), "request_id"),
+            unit_id=identifier(raw.get("unit_id"), "unit_id"),
+            starts_at=starts_at,
+            ends_at=ends_at,
+            reason=required_text(raw.get("reason"), "reason"),
         )
