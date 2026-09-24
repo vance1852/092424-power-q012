@@ -11,6 +11,7 @@ from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
 
 from .errors import SupplyError, ValidationFailed
+from .maintenance_service import MaintenanceService
 from .service import SupplyService
 from .storage import connect
 
@@ -83,6 +84,10 @@ class JsonApplication:
                 return Response(200, self.service.approve_scenario(actor, parts[1], int(payload["expected_revision"])))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "run":
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
+            if isinstance(self.service, MaintenanceService):
+                response = self._handle_maintenance(method, path, parts, actor, payload, query)
+                if response is not None:
+                    return response
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
@@ -90,6 +95,46 @@ class JsonApplication:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
         except (KeyError, TypeError, ValueError) as exc:
             return Response(422, {"error": {"code": "invalid_request", "message": str(exc)}})
+
+    def _handle_maintenance(
+        self,
+        method: str,
+        path: str,
+        parts: list[str],
+        actor: str,
+        payload: dict[str, Any],
+        query: Mapping[str, list[str]],
+    ) -> Response | None:
+        service: MaintenanceService = self.service  # type: ignore[assignment]
+        if method == "POST" and path == "/maintenance/units":
+            return Response(201, service.register_unit(actor, payload))
+        if method == "POST" and path == "/maintenance/segments":
+            return Response(201, service.define_segments(actor, payload))
+        if method == "POST" and path == "/maintenance/commitments":
+            return Response(201, service.register_commitment(actor, payload))
+        if method == "POST" and path == "/maintenance/requests":
+            return Response(201, service.request_maintenance(actor, payload))
+        if method == "POST" and len(parts) == 4 and parts[0] == "maintenance" and parts[1] == "requests" and parts[3] == "assess":
+            return Response(200, service.assess_maintenance(actor, parts[2], int(payload["expected_version"])))
+        if method == "POST" and len(parts) == 4 and parts[0] == "maintenance" and parts[1] == "requests" and parts[3] == "approve":
+            return Response(200, service.approve_maintenance(actor, parts[2], int(payload["expected_version"])))
+        if method == "POST" and len(parts) == 4 and parts[0] == "maintenance" and parts[1] == "requests" and parts[3] == "reject":
+            return Response(200, service.reject_maintenance(actor, parts[2], int(payload["expected_version"]), payload.get("reason", "")))
+        if method == "POST" and len(parts) == 4 and parts[0] == "maintenance" and parts[1] == "requests" and parts[3] == "activate":
+            return Response(200, service.activate_maintenance(actor, parts[2]))
+        if method == "POST" and len(parts) == 4 and parts[0] == "maintenance" and parts[1] == "requests" and parts[3] == "complete":
+            return Response(200, service.complete_maintenance(actor, parts[2]))
+        if method == "POST" and len(parts) == 4 and parts[0] == "maintenance" and parts[1] == "requests" and parts[3] == "extend":
+            return Response(200, service.extend_maintenance(actor, parts[2], int(payload["expected_version"]), payload["new_ends_at"], payload["reason"]))
+        if method == "POST" and len(parts) == 4 and parts[0] == "maintenance" and parts[1] == "requests" and parts[3] == "cancel":
+            return Response(200, service.cancel_maintenance(actor, parts[2], int(payload["expected_version"]), payload["reason"]))
+        if method == "GET" and len(parts) == 3 and parts[0] == "maintenance" and parts[1] == "requests":
+            return Response(200, service.maintenance_request(actor, parts[2]))
+        if method == "GET" and len(parts) == 4 and parts[0] == "maintenance" and parts[1] == "requests" and parts[3] == "replay":
+            return Response(200, service.replay_assessment(actor, parts[2], int(query.get("version", ["1"])[0])))
+        if method == "GET" and path == "/maintenance/windows":
+            return Response(200, service.effective_windows(query.get("region", [""])[0], query.get("starts_at", [""])[0], query.get("ends_at", [""])[0]))
+        return None
 
 
 def make_handler(application: JsonApplication):
@@ -126,7 +171,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args(argv)
     connection = connect(args.database)
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(JsonApplication(SupplyService(connection))))
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(JsonApplication(MaintenanceService(connection))))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

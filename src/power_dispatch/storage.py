@@ -14,7 +14,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS supply_users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor')),
+    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor','maintenance','grid')),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_at TEXT NOT NULL
 );
@@ -180,6 +180,111 @@ CREATE TABLE IF NOT EXISTS supply_idempotency (
     PRIMARY KEY(scope, idempotency_key)
 );
 
+CREATE TABLE IF NOT EXISTS maintenance_units (
+    unit_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    region TEXT NOT NULL,
+    rated_capacity_mw TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'available'
+        CHECK(state IN ('available','maintenance','retired')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_maintenance_units_region
+ON maintenance_units(region, unit_id);
+
+CREATE TABLE IF NOT EXISTS peak_valley_segments (
+    segment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    region TEXT NOT NULL,
+    starts_at TEXT NOT NULL,
+    ends_at TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('peak','flat','valley')),
+    load_mw TEXT NOT NULL,
+    reserve_threshold_mw TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_segments_region_time
+ON peak_valley_segments(region, starts_at, ends_at);
+
+CREATE TABLE IF NOT EXISTS committed_outputs (
+    commitment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    unit_id TEXT NOT NULL REFERENCES maintenance_units(unit_id),
+    starts_at TEXT NOT NULL,
+    ends_at TEXT NOT NULL,
+    committed_mw TEXT NOT NULL,
+    plan_ref TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    superseded_at TEXT,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_commitments_unit_time
+ON committed_outputs(unit_id, starts_at, ends_at);
+
+CREATE TABLE IF NOT EXISTS capability_snapshots (
+    snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_sha256 TEXT NOT NULL UNIQUE,
+    input_json TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS maintenance_requests (
+    request_id TEXT PRIMARY KEY,
+    unit_id TEXT NOT NULL REFERENCES maintenance_units(unit_id),
+    kind TEXT NOT NULL,
+    current_version INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'requested'
+        CHECK(state IN ('requested','assessed','approved','active','completed','cancelled','rejected')),
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS maintenance_versions (
+    request_id TEXT NOT NULL REFERENCES maintenance_requests(request_id),
+    version INTEGER NOT NULL,
+    change_type TEXT NOT NULL CHECK(change_type IN ('initial','extension','cancellation')),
+    supersedes_version INTEGER,
+    starts_at TEXT NOT NULL,
+    ends_at TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    snapshot_id INTEGER REFERENCES capability_snapshots(snapshot_id),
+    input_sha256 TEXT,
+    assessment_json TEXT,
+    decision TEXT CHECK(decision IS NULL OR decision IN ('approved','rejected')),
+    decided_by TEXT REFERENCES supply_users(user_id),
+    decided_at TEXT,
+    effective_from TEXT,
+    recovered_at TEXT,
+    state TEXT NOT NULL
+        CHECK(state IN ('requested','assessed','approved','active','superseded','cancelled','rejected','completed')),
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(request_id, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_maintenance_versions_effective
+ON maintenance_versions(state, starts_at, ends_at);
+
+CREATE TABLE IF NOT EXISTS maintenance_decisions (
+    decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('request','assess','approve','reject','activate','complete','extend','cancel')),
+    actor_id TEXT NOT NULL REFERENCES supply_users(user_id),
+    snapshot_id INTEGER REFERENCES capability_snapshots(snapshot_id),
+    input_sha256 TEXT,
+    result_sha256 TEXT,
+    detail_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_maintenance_decisions_chain
+ON maintenance_decisions(request_id, version, decision_id);
+
 CREATE TABLE IF NOT EXISTS supply_audit_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     entity_type TEXT NOT NULL,
@@ -198,7 +303,9 @@ ON supply_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    # ThreadingHTTPServer 会在工作线程中复用同一连接；写事务一律使用
+    # BEGIN IMMEDIATE 串行化，配合 WAL 与 busy_timeout 保证跨线程安全。
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")

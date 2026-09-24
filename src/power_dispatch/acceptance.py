@@ -9,14 +9,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .clock import FrozenClock
-from .service import SupplyService
+from .maintenance_service import MaintenanceService
 
 
 def run(workspace: Path) -> dict[str, object]:
     connection = sqlite3.connect(":memory:", isolation_level=None)
     connection.row_factory = sqlite3.Row
-    service = SupplyService(connection, FrozenClock(datetime(2026, 9, 24, 8, 0, tzinfo=timezone.utc)))
-    for user_id, role in (("plan", "planner"), ("dispatch", "dispatcher"), ("risk", "risk"), ("audit", "auditor")):
+    service = MaintenanceService(connection, FrozenClock(datetime(2026, 9, 24, 8, 0, tzinfo=timezone.utc)))
+    for user_id, role in (("plan", "planner"), ("dispatch", "dispatcher"), ("risk", "risk"), ("audit", "auditor"), ("grid", "grid"), ("maint", "maintenance")):
         service.create_user(user_id, user_id, role)
     for index, close in enumerate(("108", "105", "102", "100", "98", "96"), start=18):
         service.record_quote("plan", {"market_index": "PEAK_VALLEY", "trade_date": f"2026-09-{index}", "close_cny": close, "source_revision": f"rev-{index}", "observed_at": f"2026-09-{index}T21:00:00Z"})
@@ -30,7 +30,30 @@ def run(workspace: Path) -> dict[str, object]:
     service.create_scenario("plan", {"scenario_id": "pipeline-restart", "name": "关键机组检修恢复与需求回落", "market_index_drop_percent": "9", "route_capacity_changes": {"pipe-a-b": "20"}, "demand_changes": {"field-a:crude": "-5"}})
     service.approve_scenario("risk", "pipeline-restart", 1)
     scenario = service.run_scenario("plan", "pipeline-restart", "2026-09-23")
-    result = {"status": "ok", "price": service.price_summary("PEAK_VALLEY"), "allocation_id": allocation["allocation_id"], "transfer": transfer, "scenario_run_id": scenario["run_id"], "audit": service.audit_chain("audit"), "workspace": workspace.name}
+
+    # 机组检修错峰停机：三台 100MW 机组，两台错峰（25 日 / 26 日）均通过
+    # 峰段备用阈值校验；若同时段停两台则返回受影响峰段和原因。
+    for unit in ("gu1", "gu2", "gu3"):
+        service.register_unit("maint", {"unit_id": unit, "name": f"{unit} 号机组", "region": "north-grid", "rated_capacity_mw": "100"})
+    service.define_segments("grid", {"region": "north-grid", "segments": [
+        {"starts_at": "2026-09-25T00:00:00Z", "ends_at": "2026-09-25T08:00:00Z", "kind": "valley", "load_mw": "80", "reserve_threshold_mw": "20"},
+        {"starts_at": "2026-09-25T08:00:00Z", "ends_at": "2026-09-25T20:00:00Z", "kind": "peak", "load_mw": "150", "reserve_threshold_mw": "50"},
+        {"starts_at": "2026-09-25T20:00:00Z", "ends_at": "2026-09-26T00:00:00Z", "kind": "valley", "load_mw": "80", "reserve_threshold_mw": "20"},
+        {"starts_at": "2026-09-26T00:00:00Z", "ends_at": "2026-09-26T20:00:00Z", "kind": "peak", "load_mw": "150", "reserve_threshold_mw": "50"},
+        {"starts_at": "2026-09-26T20:00:00Z", "ends_at": "2026-09-27T00:00:00Z", "kind": "valley", "load_mw": "80", "reserve_threshold_mw": "20"},
+    ]})
+    service.request_maintenance("maint", {"request_id": "mt-1", "unit_id": "gu1", "starts_at": "2026-09-25T00:00:00Z", "ends_at": "2026-09-26T00:00:00Z", "reason": "一号机例行检修", "kind": "scheduled"})
+    first_assessment = service.assess_maintenance("risk", "mt-1", 1)
+    service.approve_maintenance("grid", "mt-1", 1)
+    service.request_maintenance("maint", {"request_id": "mt-2", "unit_id": "gu2", "starts_at": "2026-09-26T00:00:00Z", "ends_at": "2026-09-27T00:00:00Z", "reason": "二号机错峰检修", "kind": "scheduled"})
+    staggered = service.assess_maintenance("risk", "mt-2", 1)
+    service.approve_maintenance("grid", "mt-2", 1)
+    replayed = service.replay_assessment("audit", "mt-1", 1)
+
+    result = {"status": "ok", "price": service.price_summary("PEAK_VALLEY"), "allocation_id": allocation["allocation_id"], "transfer": transfer, "scenario_run_id": scenario["run_id"],
+              "maintenance": {"first_feasible": first_assessment["assessment"]["feasible"], "staggered_feasible": staggered["assessment"]["feasible"],
+                              "locked_snapshot_id": first_assessment["snapshot_id"], "replay_matches": replayed["matches"]},
+              "audit": service.audit_chain("audit"), "workspace": workspace.name}
     connection.close()
     return result
 
